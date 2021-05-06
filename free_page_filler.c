@@ -35,6 +35,9 @@ extern void vunmap(const void *addr);
 extern void *vmap(struct page **pages, unsigned int count,
                 unsigned long flags, pgprot_t prot);
 
+typedef int (*walk_pages_t)(char *kbuf, struct zone *zone,
+			   int (*walk_cb)(char *, struct list_head *));
+
 #define FILLER_ENTRY_NAME "filler_start"
 
 #define RESERVE_BUFFER_SZ		(PAGE_SIZE*2)
@@ -226,7 +229,56 @@ static int walk_all_mtypes(char *kbuf, struct zone *zone,
 	return ret;
 }
 
-static int walk_all_nodes(char *kbuf, struct pglist_data *pgdat, bool write)
+static int walk_to_read_from_zone(char *kbuf, struct zone *zone,
+			   int (*walk_cb)(char *, struct list_head *))
+{
+	struct list_head *list;
+	unsigned int type;
+	int ret = -ESRCH;
+	unsigned long signature = 0;
+
+	if (! kbuf || !zone || !walk_cb) {
+		pr_err("[%s] error kbuf[%p] zone[%p] cb[%p]\n",
+			kbuf, zone, walk_cb);
+		return -EINVAL;
+	}
+
+	pr_info("[%s] start walk through zone [%p][%s]  [%lx]-[%lx]\n", __func__,
+		 zone, zone->name, zone->zone_start_pfn, zone_end_pfn(zone));
+
+	spin_lock(&zone->lock);
+	unsigned long start = zone->zone_start_pfn, end = zone_end_pfn(zone), pfn;
+
+	for (pfn = start; pfn < end; pfn++) {
+		struct page *p = pfn_to_page(pfn);
+		void *kmapped_buffer = kmap(p);
+		if (!kmapped_buffer) {
+			pr_err("[%s] Cannot map page [%lx]\n", __func__, pfn);
+			continue;
+		}
+
+		memcpy_fromio((void*)&signature, (void*)kmapped_buffer, sizeof(unsigned long));
+
+		if (signature == FILLER_SIGN) {
+			memcpy_fromio((void*)kbuf, (void*)kmapped_buffer, RESERVE_BUFFER_SZ);
+			kunmap(kmapped_buffer);
+			pr_info("READ from  [%p][%lx]\n",
+				page_address(p), signature);
+			ret = 0;
+			break;
+		} else {
+			pr_info("NOT READ from  [%p][%p][%lx]\n",
+				page_address(p), kmapped_buffer, signature);
+		}
+		kunmap(kmapped_buffer);
+	}
+	spin_unlock(&zone->lock);
+
+	return ret;
+}
+
+static int walk_all_zones(char *kbuf, struct pglist_data *pgdat, bool write,
+			  walk_pages_t cb_pages)
 {
 	struct zone *zone;
 	unsigned long flags;
@@ -234,7 +286,7 @@ static int walk_all_nodes(char *kbuf, struct pglist_data *pgdat, bool write)
 	int (*cb_vmap)(char *, struct list_head *);
 	int ret = -ESRCH;
 
-	if (!pgdat) {
+	if (!pgdat || !cb_pages) {
 		return -EINVAL;
 	}
 
@@ -250,13 +302,13 @@ static int walk_all_nodes(char *kbuf, struct pglist_data *pgdat, bool write)
 		}
 
 		if (!strncmp(zone->name, DMA, DMA_LEN)) {
-			ret = walk_all_mtypes(kbuf, zone, cb_kmap);
+			ret = cb_pages(kbuf, zone, cb_kmap);
 			if (!ret)
 				break;
 		}
 
 		if (!strncmp(zone->name, NORMAL, NORMAL_LEN)) {
-			ret = walk_all_mtypes(kbuf, zone, cb_vmap);
+			ret = cb_pages(kbuf, zone, cb_vmap);
 			if (!ret)
 				break;
 		}
@@ -266,12 +318,13 @@ static int walk_all_nodes(char *kbuf, struct pglist_data *pgdat, bool write)
 	return ret;
 }
 
-static int walk_all_pgdat(char *kbuf, bool write)
+
+static int walk_all_nodes(char *kbuf, bool write)
 {
 	struct pglist_data *pgdat;
 	unsigned int cpu;
 	int nid, ret = -ESRCH;
-
+	walk_pages_t cb_pages = (write) ? walk_all_mtypes : walk_to_read_from_zone;
 	pr_info("[%s] start walking\n", __func__);
 
 	cpu_maps_update_begin();
@@ -280,7 +333,7 @@ static int walk_all_pgdat(char *kbuf, bool write)
 		pgdat = NODE_DATA(nid);
 
 		pr_info("[%s] nid [%d] pgdat [%p]\n", __func__, nid, pgdat);
-		ret = walk_all_nodes(kbuf, pgdat, write);
+		ret = walk_all_zones(kbuf, pgdat, write, cb_pages);
 		if (!ret)
 			break;
 	}
@@ -295,7 +348,7 @@ static int walk_all_pgdat(char *kbuf, bool write)
 
 static int write_to_free_mem(char *kbuf)
 {
-	return walk_all_pgdat(kbuf, 1);
+	return walk_all_nodes(kbuf, 1);
 }
 
 static ssize_t filler_write(struct file *file, const char __user *buf,
@@ -314,7 +367,7 @@ static ssize_t filler_write(struct file *file, const char __user *buf,
 
 static int read_from_free_mem(char *kbuf)
 {
-	return walk_all_pgdat(kbuf, 0);
+	return walk_all_nodes(kbuf, 0);
 }
 
 static ssize_t filler_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
