@@ -62,9 +62,9 @@ echo 0 > /proc/filler_start
 It was tested on: 
  - ubuntu-xenial with kernel-4.4.0-206-generic.
  - ubuntu-bionic with kernel-4.15.0-142.146.
- - ubuntu-bionic-hwe with kernel-4.18.0-25.26~18.04.1, kernel-kernel-5.0.0-37.40~18.04.1 and kernel-5.3.0-74.70.
+ - ubuntu-bionic-hwe with kernel-4.18.0-25.26_18.04.1, kernel-kernel-5.0.0-37.40_18.04.1 and kernel-5.3.0-74.70.
  - ubuntu-focal with kernel-5.4.0-72.80.
- - ubuntu-focal-hwe with kernel-5.8.0-53.60~20.04.1.
+ - ubuntu-focal-hwe with kernel-5.8.0-53.60_20.04.1.
  - debian8 with linux-3.16.84-1.
  - debian9 with linux-4.9.258-1.
  - debian10 with linux-4.19.181-1.
