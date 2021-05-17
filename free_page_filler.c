@@ -30,13 +30,13 @@
 #include <asm-generic/io.h>
 #include <asm/e820/types.h>
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+#include <linux/kmsg_dump.h>
+#endif
 
 extern void vunmap(const void *addr);
 extern void *vmap(struct page **pages, unsigned int count,
                 unsigned long flags, pgprot_t prot);
-
-typedef int (*walk_pages_t)(char *kbuf, struct zone *zone,
-			   int (*walk_cb)(char *, struct list_head *));
 
 #define FILLER_ENTRY_NAME "filler_start"
 
@@ -50,9 +50,6 @@ typedef int (*walk_pages_t)(char *kbuf, struct zone *zone,
 
 #define NORMAL "Normal"
 #define NORMAL_LEN strlen(NORMAL)
-
-#define MOVABLE "Movable"
-#define MOVABLE_LEN strlen(MOVABLE)
 
 
 static atomic_t filler_opened = ATOMIC_INIT(0);
@@ -96,37 +93,6 @@ static int walk_all_free_pages_kmap_and_write(char *kbuf, struct list_head *list
 	return 1;
 }
 
-static int walk_all_free_pages_vmap_and_write(char *kbuf, struct list_head *list)
-{
-	struct page *p, *next;
-	void *kmapped_buffer = NULL;
-
-	if (!list)
-		return -EINVAL;
-
-	list_for_each_entry_safe(p, next, list, lru) {
-		struct page **pages;
-		void *vaddr = NULL;
-
-		pages = kmalloc_array(1, sizeof(struct page *), GFP_KERNEL);
-		if (!pages) {
-			pr_err("[%s] cannot kmalloc array buffer [%p]\n",
-				 __func__, page_address(p));
-			continue;
-		}
-		pages[0] = p;
-		vaddr = vmap(pages, 1, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
-		kfree(pages);
-
-		memcpy(vaddr, kbuf, RESERVE_BUFFER_SZ);
-		vunmap(vaddr);
-
-		pr_info("[%s] written to page [%p]\n", __func__, page_address(p));
-	}
-
-	return 1;
-}
-
 static int walk_all_free_pages_kmap_and_read(char *kbuf, struct list_head *list)
 {
 	struct page *p, *next;
@@ -137,6 +103,9 @@ static int walk_all_free_pages_kmap_and_read(char *kbuf, struct list_head *list)
 
 	list_for_each_entry_safe(p, next, list, lru) {
 		void *kmapped_buffer = kmap(p);
+		if (!kmapped_buffer) {
+			pr_err("[%s] Cannot kmap page [%p]\n", __func__, p);
+		}
 
 		memcpy_fromio((void*)&signature, (void*)kmapped_buffer, sizeof(unsigned long));
 
@@ -156,142 +125,65 @@ static int walk_all_free_pages_kmap_and_read(char *kbuf, struct list_head *list)
 	return -ESRCH;
 }
 
-static int walk_all_free_pages_vmap_and_read(char *kbuf, struct list_head *list)
-{
-	struct page *p, *next;
-	unsigned long signature = 0;
-
-	if (!list)
-		return -EINVAL;
-
-	list_for_each_entry_safe(p, next, list, lru) {
-		struct page **pages;
-		void *vaddr = NULL;
-
-		pages = kmalloc_array(1, sizeof(struct page *), GFP_KERNEL);
-		if (!pages) {
-			pr_err("[%s] cannot kmalloc array buffer [%p]\n",
-				 __func__, page_address(p));
-			continue;
-		}
-		pages[0] = p;
-		vaddr = vmap(pages, 1, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
-		kfree(pages);
-
-		memcpy((void*)&signature, vaddr, sizeof(unsigned long));
-		if (signature == FILLER_SIGN) {
-			memcpy((void*)kbuf, vaddr, RESERVE_BUFFER_SZ);
-			vunmap(vaddr);
-
-			pr_info("READ from  [%p][%lx]\n",
-				page_address(p),  signature);
-			return 0;
-		} else {
-			pr_info("NOT READ from  [%p][%p][%lx]\n",
-				page_address(p), vmap, signature);
-		}
-		vunmap(vaddr);
-
-		pr_info("[%s] written to page [%p]\n", __func__, page_address(p));
-	}
-
-	return -ESRCH;
-}
-
-
-static int walk_all_mtypes(char *kbuf, struct zone *zone,
+static int walk_all_mtypes(char *kbuf, struct free_area *free_area,
 			   int (*walk_cb)(char *, struct list_head *))
 {
 	struct list_head *list;
 	unsigned int type;
 	int ret = -ESRCH;
 
-	if (! kbuf || !zone || !walk_cb) {
-		pr_err("[%s] error kbuf[%p] zone[%p] cb[%p]\n",
-			kbuf, zone, walk_cb);
+	if (! kbuf || !walk_cb) {
+		pr_err("[%s] error kbuf[%p] free_area[%p] cb[%p]\n",
+			kbuf, free_area, walk_cb);
 		return -EINVAL;
 	}
 
-	pr_info("[%s] start walk through zone [%p][%s]  [%lx]-[%lx]\n", __func__,
-		 zone, zone->name, zone->zone_start_pfn, zone_end_pfn(zone));
 
-	spin_lock(&zone->lock);
 	for (type = 0; type < MIGRATE_TYPES; type++) {
-		pr_info("[%s] start walk through type [%d]\n", __func__, type);
-
-		list = &zone->free_area[PAGES_PER_RESERVE_BUFFER].free_list[type];
-		ret  = walk_cb(kbuf, list);
+		pr_info("[%s] start walk through type [%d] nr_free[%u]\n",
+			__func__, type, free_area->nr_free);
+		list = &free_area->free_list[type];
+		ret = walk_cb(kbuf, list);
 		if (!ret)
 			break;
 	}
-	spin_unlock(&zone->lock);
 
 	return ret;
 }
 
-static int walk_to_read_from_zone(char *kbuf, struct zone *zone,
+static int walk_all_orders(char *kbuf, struct zone *zone,
 			   int (*walk_cb)(char *, struct list_head *))
 {
-	struct list_head *list;
-	unsigned int type;
+	struct free_area *free_area;
+	unsigned long flags;
+	unsigned int order;
 	int ret = -ESRCH;
-	unsigned long signature = 0;
 
-	if (! kbuf || !zone || !walk_cb) {
-		pr_err("[%s] error kbuf[%p] zone[%p] cb[%p]\n",
-			kbuf, zone, walk_cb);
-		return -EINVAL;
-	}
-
-	pr_info("[%s] start walk through zone [%p][%s]  [%lx]-[%lx]\n", __func__,
-		 zone, zone->name, zone->zone_start_pfn, zone_end_pfn(zone));
-
-	spin_lock(&zone->lock);
-	unsigned long start = zone->zone_start_pfn, end = zone_end_pfn(zone), pfn;
-
-	for (pfn = start; pfn < end; pfn++) {
-		struct page *p = pfn_to_page(pfn);
-		void *kmapped_buffer = kmap(p);
-		if (!kmapped_buffer) {
-			pr_err("[%s] Cannot map page [%lx]\n", __func__, pfn);
-			continue;
-		}
-
-		memcpy_fromio((void*)&signature, (void*)kmapped_buffer, sizeof(unsigned long));
-
-		if (signature == FILLER_SIGN) {
-			memcpy_fromio((void*)kbuf, (void*)kmapped_buffer, RESERVE_BUFFER_SZ);
-			kunmap(kmapped_buffer);
-			pr_info("READ from  [%p][%lx]\n",
-				page_address(p), signature);
-			ret = 0;
+	spin_lock_irqsave(&zone->lock, flags);
+	for (order = PAGES_PER_RESERVE_BUFFER; order < MAX_ORDER; order++) {
+		pr_info("[%s] start walk through order [%d]\n", __func__, order);
+		free_area = &zone->free_area[order];
+		ret = walk_all_mtypes(kbuf, free_area, walk_cb);
+		if (!ret)
 			break;
-		} else {
-			pr_info("NOT READ from  [%p][%p][%lx]\n",
-				page_address(p), kmapped_buffer, signature);
-		}
-		kunmap(kmapped_buffer);
 	}
-	spin_unlock(&zone->lock);
+	spin_unlock_irqrestore(&zone->lock, flags);
 
 	return ret;
 }
 
-static int walk_all_zones(char *kbuf, struct pglist_data *pgdat, bool write,
-			  walk_pages_t cb_pages)
+static int walk_all_zones(char *kbuf, struct pglist_data *pgdat, bool write)
 {
 	struct zone *zone;
 	unsigned long flags;
 	int (*cb_kmap)(char *, struct list_head *);
-	int (*cb_vmap)(char *, struct list_head *);
 	int ret = -ESRCH;
 
-	if (!pgdat || !cb_pages) {
+	if (!pgdat) {
 		return -EINVAL;
 	}
 
 	cb_kmap = (write) ? walk_all_free_pages_kmap_and_write : walk_all_free_pages_kmap_and_read; 
-	cb_vmap = (write) ? walk_all_free_pages_vmap_and_write : walk_all_free_pages_vmap_and_read; 
 
 	pgdat_resize_lock(pgdat, &flags);
 	for (zone = pgdat->node_zones; zone < pgdat->node_zones + MAX_NR_ZONES; zone++) {
@@ -302,13 +194,13 @@ static int walk_all_zones(char *kbuf, struct pglist_data *pgdat, bool write,
 		}
 
 		if (!strncmp(zone->name, DMA, DMA_LEN)) {
-			ret = cb_pages(kbuf, zone, cb_kmap);
+			ret = walk_all_orders(kbuf, zone, cb_kmap);
 			if (!ret)
 				break;
 		}
 
 		if (!strncmp(zone->name, NORMAL, NORMAL_LEN)) {
-			ret = cb_pages(kbuf, zone, cb_vmap);
+			ret = walk_all_orders(kbuf, zone, cb_kmap);
 			if (!ret)
 				break;
 		}
@@ -324,22 +216,21 @@ static int walk_all_nodes(char *kbuf, bool write)
 	struct pglist_data *pgdat;
 	unsigned int cpu;
 	int nid, ret = -ESRCH;
-	walk_pages_t cb_pages = (write) ? walk_all_mtypes : walk_to_read_from_zone;
-	pr_info("[%s] start walking\n", __func__);
 
-	cpu_maps_update_begin();
+	pr_info("[%s] start walking\n", __func__);
+	get_online_cpus();
 	for_each_online_cpu(cpu) {
 		nid = cpu_to_node(cpu);
 		pgdat = NODE_DATA(nid);
 
 		pr_info("[%s] nid [%d] pgdat [%p]\n", __func__, nid, pgdat);
-		ret = walk_all_zones(kbuf, pgdat, write, cb_pages);
+		ret = walk_all_zones(kbuf, pgdat, write);
 		if (!ret)
 			break;
 	}
-	cpu_maps_update_done();
+	put_online_cpus();
 
-	pr_err("[%s] end walking \n", __func__);
+	pr_info("[%s] end walking \n", __func__);
 
 	__flush_tlb_all();
 
@@ -391,6 +282,7 @@ static ssize_t filler_read(struct file *file, char __user *buf, size_t size, lof
 }
 
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,6,0)
 struct file_operations filler_fops = {
 	.owner	= THIS_MODULE,
 	.read	= filler_read,
@@ -398,6 +290,14 @@ struct file_operations filler_fops = {
 	.open	= filler_open,
 	.release= filler_release,
 };
+#else
+struct proc_ops filler_fops = {
+        .proc_open      = filler_open,
+        .proc_read      = filler_read,
+        .proc_write     = filler_write,
+	.proc_release	= filler_release,
+};
+#endif
 
 
 static int __init filler_init(void)
